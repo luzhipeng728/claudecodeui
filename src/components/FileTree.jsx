@@ -1,11 +1,12 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { ScrollArea } from './ui/scroll-area';
 import { Button } from './ui/button';
-import { Folder, FolderOpen, File, FileText, FileCode, List, TableProperties, Eye } from 'lucide-react';
+import { Folder, FolderOpen, File, FileText, FileCode, List, TableProperties, Eye, Upload, Trash2, Edit, Plus } from 'lucide-react';
 import { cn } from '../lib/utils';
 import CodeEditor from './CodeEditor';
 import ImageViewer from './ImageViewer';
 import { api } from '../utils/api';
+import { Input } from './ui/input';
 
 function FileTree({ selectedProject }) {
   const [files, setFiles] = useState([]);
@@ -14,6 +15,8 @@ function FileTree({ selectedProject }) {
   const [selectedFile, setSelectedFile] = useState(null);
   const [selectedImage, setSelectedImage] = useState(null);
   const [viewMode, setViewMode] = useState('detailed'); // 'simple', 'detailed', 'compact'
+  const [renamingFile, setRenamingFile] = useState(null);
+  const [newFileName, setNewFileName] = useState('');
 
   useEffect(() => {
     if (selectedProject) {
@@ -51,6 +54,94 @@ function FileTree({ selectedProject }) {
     }
   };
 
+  const handleFileUpload = async (event) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+
+    const formData = new FormData();
+    
+    // Add files without folder structure
+    Array.from(files).forEach((file) => {
+      formData.append('files', file);
+      formData.append('paths', file.name);
+    });
+
+    try {
+      const token = localStorage.getItem('auth-token');
+      const headers = {};
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      
+      const response = await fetch(`/api/projects/${selectedProject.name}/upload-folder`, {
+        method: 'POST',
+        headers: headers,
+        body: formData,
+      });
+
+      if (response.ok) {
+        console.log('✅ Files uploaded successfully');
+        await fetchFiles();
+      } else {
+        const error = await response.text();
+        console.error('❌ Upload failed:', error);
+        alert('Upload failed: ' + error);
+      }
+    } catch (error) {
+      console.error('❌ Upload error:', error);
+      alert('Upload error: ' + error.message);
+    }
+
+    event.target.value = '';
+  };
+
+  const handleFolderUpload = async (event) => {
+    const files = event.target.files;
+    if (!files || files.length === 0) return;
+
+    // Create FormData and organize files by folder structure
+    const formData = new FormData();
+    
+    // Get all file paths
+    const fileList = Array.from(files);
+    fileList.forEach((file) => {
+      // Get relative path from webkitRelativePath
+      const relativePath = file.webkitRelativePath || file.name;
+      formData.append('files', file);
+      formData.append('paths', relativePath);
+    });
+
+    try {
+      const token = localStorage.getItem('auth-token');
+      const headers = {};
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      
+      const response = await fetch(`/api/projects/${selectedProject.name}/upload-folder`, {
+        method: 'POST',
+        headers: headers,
+        body: formData,
+      });
+
+      if (response.ok) {
+        console.log('✅ Folder uploaded successfully');
+        // Refresh file tree
+        await fetchFiles();
+      } else {
+        const error = await response.text();
+        console.error('❌ Upload failed:', error);
+        alert('Upload failed: ' + error);
+      }
+    } catch (error) {
+      console.error('❌ Upload error:', error);
+      alert('Upload error: ' + error.message);
+    }
+
+    // Reset input
+    event.target.value = '';
+  };
+
   const toggleDirectory = (path) => {
     const newExpanded = new Set(expandedDirs);
     if (newExpanded.has(path)) {
@@ -59,6 +150,109 @@ function FileTree({ selectedProject }) {
       newExpanded.add(path);
     }
     setExpandedDirs(newExpanded);
+  };
+
+  const handleDelete = async (item) => {
+    if (!confirm(`Are you sure you want to delete ${item.name}?`)) {
+      return;
+    }
+
+    try {
+      const token = localStorage.getItem('auth-token');
+      const response = await fetch(`/api/projects/${selectedProject.name}/delete`, {
+        method: 'POST',
+        headers: {
+          'Authorization': token ? `Bearer ${token}` : '',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ path: item.path })
+      });
+
+      if (response.ok) {
+        console.log('✅ Deleted successfully');
+        await fetchFiles();
+      } else {
+        const error = await response.text();
+        alert('Delete failed: ' + error);
+      }
+    } catch (error) {
+      console.error('❌ Delete error:', error);
+      alert('Delete error: ' + error.message);
+    }
+  };
+
+  const handleRename = async (item) => {
+    if (!newFileName || newFileName === item.name) {
+      setRenamingFile(null);
+      return;
+    }
+
+    try {
+      const token = localStorage.getItem('auth-token');
+      const newPath = item.path.replace(/[^/]+$/, newFileName);
+      
+      const response = await fetch(`/api/projects/${selectedProject.name}/rename`, {
+        method: 'POST',
+        headers: {
+          'Authorization': token ? `Bearer ${token}` : '',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ oldPath: item.path, newPath: newPath })
+      });
+
+      if (response.ok) {
+        console.log('✅ Renamed successfully');
+        setRenamingFile(null);
+        await fetchFiles();
+      } else {
+        const error = await response.text();
+        alert('Rename failed: ' + error);
+      }
+    } catch (error) {
+      console.error('❌ Rename error:', error);
+      alert('Rename error: ' + error.message);
+    }
+  };
+
+  const startRename = (item) => {
+    setRenamingFile(item.path);
+    setNewFileName(item.name);
+  };
+
+  const handleCreateNewFile = async () => {
+    const fileName = prompt('Enter file name:');
+    if (!fileName) return;
+
+    try {
+      const token = localStorage.getItem('auth-token');
+      const response = await fetch(`/api/projects/${selectedProject.name}/file`, {
+        method: 'PUT',
+        headers: {
+          'Authorization': token ? `Bearer ${token}` : '',
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ filePath: fileName, content: '' })
+      });
+
+      if (response.ok) {
+        console.log('✅ File created successfully');
+        await fetchFiles();
+        
+        // Open the new file in editor
+        setSelectedFile({
+          name: fileName,
+          path: fileName,
+          projectPath: selectedProject.path,
+          projectName: selectedProject.name
+        });
+      } else {
+        const error = await response.text();
+        alert('Create failed: ' + error);
+      }
+    } catch (error) {
+      console.error('❌ Create error:', error);
+      alert('Create error: ' + error.message);
+    }
   };
 
   // Change view mode and save preference
@@ -92,50 +286,92 @@ function FileTree({ selectedProject }) {
 
   const renderFileTree = (items, level = 0) => {
     return items.map((item) => (
-      <div key={item.path} className="select-none">
-        <Button
-          variant="ghost"
-          className={cn(
-            "w-full justify-start p-2 h-auto font-normal text-left hover:bg-accent",
-          )}
-          style={{ paddingLeft: `${level * 16 + 12}px` }}
-          onClick={() => {
-            if (item.type === 'directory') {
-              toggleDirectory(item.path);
-            } else if (isImageFile(item.name)) {
-              // Open image in viewer
-              setSelectedImage({
-                name: item.name,
-                path: item.path,
-                projectPath: selectedProject.path,
-                projectName: selectedProject.name
-              });
-            } else {
-              // Open file in editor
-              setSelectedFile({
-                name: item.name,
-                path: item.path,
-                projectPath: selectedProject.path,
-                projectName: selectedProject.name
-              });
-            }
-          }}
-        >
-          <div className="flex items-center gap-2 min-w-0 w-full">
-            {item.type === 'directory' ? (
-              expandedDirs.has(item.path) ? (
-                <FolderOpen className="w-4 h-4 text-blue-500 flex-shrink-0" />
-              ) : (
-                <Folder className="w-4 h-4 text-muted-foreground flex-shrink-0" />
-              )
-            ) : (
-              getFileIcon(item.name)
+      <div key={item.path} className="select-none group">
+        <div className="flex items-center">
+          <Button
+            variant="ghost"
+            className={cn(
+              "flex-1 justify-start p-2 h-auto font-normal text-left hover:bg-accent",
             )}
-            <span className="text-sm truncate text-foreground">
-              {item.name}
-            </span>
+            style={{ paddingLeft: `${level * 16 + 12}px` }}
+            onClick={() => {
+              if (item.type === 'directory') {
+                toggleDirectory(item.path);
+              } else if (isImageFile(item.name)) {
+                // Open image in viewer
+                setSelectedImage({
+                  name: item.name,
+                  path: item.path,
+                  projectPath: selectedProject.path,
+                  projectName: selectedProject.name
+                });
+              } else {
+                // Open file in editor
+                setSelectedFile({
+                  name: item.name,
+                  path: item.path,
+                  projectPath: selectedProject.path,
+                  projectName: selectedProject.name
+                });
+              }
+            }}
+          >
+            <div className="flex items-center gap-2 min-w-0 w-full">
+              {item.type === 'directory' ? (
+                expandedDirs.has(item.path) ? (
+                  <FolderOpen className="w-4 h-4 text-blue-500 flex-shrink-0" />
+                ) : (
+                  <Folder className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+                )
+              ) : (
+                getFileIcon(item.name)
+              )}
+              {renamingFile === item.path ? (
+                <Input
+                  value={newFileName}
+                  onChange={(e) => setNewFileName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      handleRename(item);
+                    } else if (e.key === 'Escape') {
+                      setRenamingFile(null);
+                    }
+                  }}
+                  onBlur={() => handleRename(item)}
+                  className="h-6 text-sm"
+                  autoFocus
+                  onClick={(e) => e.stopPropagation()}
+                />
+              ) : (
+                <span className="text-sm truncate text-foreground">
+                  {item.name}
+                </span>
+              )}
+            </div>
+          </Button>
+          
+          {/* Action buttons */}
+          <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0"
+              onClick={() => startRename(item)}
+              title="Rename"
+            >
+              <Edit className="h-3 w-3" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0 hover:bg-destructive/10 hover:text-destructive"
+              onClick={() => handleDelete(item)}
+              title="Delete"
+            >
+              <Trash2 className="h-3 w-3" />
+            </Button>
           </div>
-        </Button>
+        </div>
         
         {item.type === 'directory' && 
          expandedDirs.has(item.path) && 
@@ -312,6 +548,54 @@ function FileTree({ selectedProject }) {
       <div className="p-4 border-b border-border flex items-center justify-between">
         <h3 className="text-sm font-medium text-foreground">Files</h3>
         <div className="flex gap-1">
+          {/* New File Button */}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-8 p-0"
+            onClick={() => handleCreateNewFile()}
+            title="New file"
+          >
+            <Plus className="w-4 h-4" />
+          </Button>
+          
+          {/* Upload File Button */}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-8 p-0"
+            onClick={() => document.getElementById('file-upload-input').click()}
+            title="Upload files"
+          >
+            <File className="w-4 h-4" />
+          </Button>
+          <input
+            id="file-upload-input"
+            type="file"
+            multiple
+            className="hidden"
+            onChange={handleFileUpload}
+          />
+          
+          {/* Upload Folder Button */}
+          <Button
+            variant="ghost"
+            size="sm"
+            className="h-8 w-8 p-0 mr-2"
+            onClick={() => document.getElementById('folder-upload-input').click()}
+            title="Upload folder"
+          >
+            <Folder className="w-4 h-4" />
+          </Button>
+          <input
+            id="folder-upload-input"
+            type="file"
+            multiple
+            webkitdirectory=""
+            directory=""
+            className="hidden"
+            onChange={handleFolderUpload}
+          />
           <Button
             variant={viewMode === 'simple' ? 'default' : 'ghost'}
             size="sm"

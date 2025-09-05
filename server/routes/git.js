@@ -29,14 +29,26 @@ async function validateGitRepository(projectPath) {
   }
 
   try {
-    // Use --show-toplevel to get the root of the git repository
-    const { stdout: gitRoot } = await execAsync('git rev-parse --show-toplevel', { cwd: projectPath });
-    const normalizedGitRoot = path.resolve(gitRoot.trim());
-    const normalizedProjectPath = path.resolve(projectPath);
+    // First check if it's a git repository at all
+    await execAsync('git rev-parse --git-dir', { cwd: projectPath });
     
-    // Ensure the git root matches our project path (prevent using parent git repos)
-    if (normalizedGitRoot !== normalizedProjectPath) {
-      throw new Error(`Project directory is not a git repository. This directory is inside a git repository at ${normalizedGitRoot}, but git operations should be run from the repository root.`);
+    // Try to get the root of the git repository
+    try {
+      const { stdout: gitRoot } = await execAsync('git rev-parse --show-toplevel', { cwd: projectPath });
+      const normalizedGitRoot = path.resolve(gitRoot.trim());
+      const normalizedProjectPath = path.resolve(projectPath);
+      
+      // Ensure the git root matches our project path (prevent using parent git repos)
+      if (normalizedGitRoot !== normalizedProjectPath) {
+        throw new Error(`Project directory is not a git repository. This directory is inside a git repository at ${normalizedGitRoot}, but git operations should be run from the repository root.`);
+      }
+    } catch (error) {
+      // If --show-toplevel fails, it might be because there are no commits yet
+      if (error.message.includes('ambiguous argument') || error.message.includes('unknown revision')) {
+        // It's a valid git repo but with no commits yet - this is OK
+        return;
+      }
+      throw error;
     }
   } catch (error) {
     if (error.message.includes('Project directory is not a git repository')) {
@@ -60,8 +72,22 @@ router.get('/status', async (req, res) => {
     // Validate git repository
     await validateGitRepository(projectPath);
 
-    // Get current branch
-    const { stdout: branch } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath });
+    let branch = 'main'; // default branch name
+    try {
+      // Get current branch
+      const { stdout: branchOutput } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath });
+      branch = branchOutput.trim();
+    } catch (error) {
+      // If HEAD doesn't exist (no commits yet), check for initial branch config
+      try {
+        const { stdout: initialBranch } = await execAsync('git config init.defaultBranch', { cwd: projectPath });
+        if (initialBranch.trim()) {
+          branch = initialBranch.trim();
+        }
+      } catch (configError) {
+        // Use default
+      }
+    }
     
     // Get git status
     const { stdout: statusOutput } = await execAsync('git status --porcelain', { cwd: projectPath });
@@ -96,12 +122,23 @@ router.get('/status', async (req, res) => {
       untracked
     });
   } catch (error) {
+    // If it's not a git repository, return a non-error response
+    if (error.message.includes('Not a git repository') || error.message.includes('Project directory is not a git repository')) {
+      return res.json({
+        isGitRepo: false,
+        message: 'This directory is not a git repository. Use "git init" to initialize.',
+        branch: null,
+        modified: [],
+        added: [],
+        deleted: [],
+        untracked: []
+      });
+    }
+    
     console.error('Git status error:', error);
     res.json({ 
-      error: error.message.includes('not a git repository') || error.message.includes('Project directory is not a git repository') 
-        ? error.message 
-        : 'Git operation failed',
-      details: error.message.includes('not a git repository') || error.message.includes('Project directory is not a git repository')
+      error: 'Git operation failed',
+      details: error.message
         ? error.message
         : `Failed to get git status: ${error.message}`
     });
@@ -221,6 +258,15 @@ router.get('/branches', async (req, res) => {
     
     res.json({ branches });
   } catch (error) {
+    // If it's not a git repository, return a non-error response
+    if (error.message.includes('Not a git repository') || error.message.includes('Project directory is not a git repository')) {
+      return res.json({
+        isGitRepo: false,
+        message: 'This directory is not a git repository.',
+        branches: []
+      });
+    }
+    
     console.error('Git branches error:', error);
     res.json({ error: error.message });
   }
@@ -433,9 +479,28 @@ router.get('/remote-status', async (req, res) => {
     const projectPath = await getActualProjectPath(project);
     await validateGitRepository(projectPath);
 
-    // Get current branch
-    const { stdout: currentBranch } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath });
-    const branch = currentBranch.trim();
+    let branch = 'main'; // default branch name
+    try {
+      // Get current branch
+      const { stdout: currentBranch } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath });
+      branch = currentBranch.trim();
+    } catch (error) {
+      // If HEAD doesn't exist (no commits yet), use default
+      // Check if it's actually a git repo with no commits
+      try {
+        await execAsync('git rev-parse --git-dir', { cwd: projectPath });
+        // It's a git repo but no commits yet
+        return res.json({
+          hasRemote: false,
+          ahead: 0,
+          behind: 0,
+          isUpToDate: true,
+          message: 'No commits yet in this repository'
+        });
+      } catch (gitError) {
+        throw error; // Re-throw if not a git repo
+      }
+    }
 
     // Check if there's a remote tracking branch (smart detection)
     let trackingBranch;
@@ -487,6 +552,17 @@ router.get('/remote-status', async (req, res) => {
       isUpToDate: ahead === 0 && behind === 0
     });
   } catch (error) {
+    // If it's not a git repository, return a non-error response
+    if (error.message.includes('Not a git repository') || error.message.includes('Project directory is not a git repository')) {
+      return res.json({
+        isGitRepo: false,
+        message: 'This directory is not a git repository.',
+        ahead: 0,
+        behind: 0,
+        hasRemote: false
+      });
+    }
+    
     console.error('Git remote status error:', error);
     res.json({ error: error.message });
   }
@@ -505,8 +581,14 @@ router.post('/fetch', async (req, res) => {
     await validateGitRepository(projectPath);
 
     // Get current branch and its upstream remote
-    const { stdout: currentBranch } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath });
-    const branch = currentBranch.trim();
+    let branch = 'main'; // default
+    try {
+      const { stdout: currentBranch } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath });
+      branch = currentBranch.trim();
+    } catch (error) {
+      // No commits yet, use default branch
+      console.log('No commits yet, using default branch name');
+    }
 
     let remoteName = 'origin'; // fallback
     try {
@@ -546,8 +628,14 @@ router.post('/pull', async (req, res) => {
     await validateGitRepository(projectPath);
 
     // Get current branch and its upstream remote
-    const { stdout: currentBranch } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath });
-    const branch = currentBranch.trim();
+    let branch = 'main'; // default
+    try {
+      const { stdout: currentBranch } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath });
+      branch = currentBranch.trim();
+    } catch (error) {
+      // No commits yet, use default branch
+      console.log('No commits yet, using default branch name');
+    }
 
     let remoteName = 'origin'; // fallback
     let remoteBranch = branch; // fallback
@@ -613,8 +701,14 @@ router.post('/push', async (req, res) => {
     await validateGitRepository(projectPath);
 
     // Get current branch and its upstream remote
-    const { stdout: currentBranch } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath });
-    const branch = currentBranch.trim();
+    let branch = 'main'; // default
+    try {
+      const { stdout: currentBranch } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath });
+      branch = currentBranch.trim();
+    } catch (error) {
+      // No commits yet, use default branch
+      console.log('No commits yet, using default branch name');
+    }
 
     let remoteName = 'origin'; // fallback
     let remoteBranch = branch; // fallback
@@ -683,8 +777,14 @@ router.post('/publish', async (req, res) => {
     await validateGitRepository(projectPath);
 
     // Get current branch to verify it matches the requested branch
-    const { stdout: currentBranch } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath });
-    const currentBranchName = currentBranch.trim();
+    let currentBranchName = 'main'; // default
+    try {
+      const { stdout: currentBranch } = await execAsync('git rev-parse --abbrev-ref HEAD', { cwd: projectPath });
+      currentBranchName = currentBranch.trim();
+    } catch (error) {
+      // No commits yet, use default branch
+      console.log('No commits yet, using default branch name');
+    }
     
     if (currentBranchName !== branch) {
       return res.status(400).json({ 

@@ -10,6 +10,11 @@ export default defineConfig(({ command, mode }) => {
     plugins: [react()],
     server: {
       port: parseInt(env.VITE_PORT) || 5173,
+      host: true,
+      hmr: {
+        clientPort: 443
+      },
+      allowedHosts: ['haha.luzhipeng.com', 'myclaude.luzhipeng.com', 'localhost', '127.0.0.1'],
       proxy: {
         '/api': `http://localhost:${env.PORT || 3001}`,
         '/ws': {
@@ -18,6 +23,10 @@ export default defineConfig(({ command, mode }) => {
         },
         '/shell': {
           target: `ws://localhost:${env.PORT || 3002}`,
+          ws: true
+        },
+        '/terminal': {
+          target: `ws://localhost:${env.PORT || 3001}`,
           ws: true
         }
       }

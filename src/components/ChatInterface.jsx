@@ -23,6 +23,7 @@ import TodoList from './TodoList';
 import ClaudeLogo from './ClaudeLogo.jsx';
 import CursorLogo from './CursorLogo.jsx';
 import NextTaskBanner from './NextTaskBanner.jsx';
+import LinkifiedText from './LinkifiedText';
 import { useTasksSettings } from '../contexts/TasksSettingsContext';
 
 import ClaudeStatus from './ClaudeStatus';
@@ -1086,16 +1087,65 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
                             {children}
                           </blockquote>
                         ),
-                        a: ({href, children}) => (
-                          <a href={href} className="text-blue-600 dark:text-blue-400 hover:underline" target="_blank" rel="noopener noreferrer">
-                            {children}
-                          </a>
-                        ),
-                        p: ({children}) => (
-                          <div className="mb-2 last:mb-0">
-                            {children}
-                          </div>
-                        )
+                        a: ({href, children}) => {
+                          // Enhanced image URL detection
+                          const imageExtensions = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp', '.ico', '.avif'];
+                          const imageHosts = ['imgur.com', 'i.imgur.com', 'unsplash.com', 'cloudinary.com', 'discordapp.com/attachments', 'githubusercontent.com'];
+                          
+                          const isImageLink = imageExtensions.some(ext => href?.toLowerCase().includes(ext)) || 
+                                              href?.match(/\.(jpg|jpeg|png|gif|webp|svg|bmp|ico|avif)(\?|#|$)/i) ||
+                                              imageHosts.some(host => href?.toLowerCase().includes(host));
+                          
+                          if (isImageLink) {
+                            return (
+                              <div className="my-3 inline-block">
+                                <a href={href} target="_blank" rel="noopener noreferrer" className="block">
+                                  <img 
+                                    src={href} 
+                                    alt={children || 'Image'} 
+                                    className="max-w-full rounded-lg shadow-md hover:shadow-lg transition-shadow cursor-pointer"
+                                    style={{ maxHeight: '400px', objectFit: 'contain' }}
+                                    loading="lazy"
+                                    onError={(e) => {
+                                      // If image fails to load, show as regular link
+                                      e.target.style.display = 'none';
+                                      e.target.nextSibling.style.display = 'inline-block';
+                                    }}
+                                  />
+                                  <span style={{ display: 'none' }} className="text-blue-600 dark:text-blue-400 hover:underline">
+                                    {children || href}
+                                  </span>
+                                </a>
+                              </div>
+                            );
+                          }
+                          
+                          return (
+                            <a href={href} className="text-blue-600 dark:text-blue-400 hover:underline break-all" target="_blank" rel="noopener noreferrer">
+                              {children || href}
+                            </a>
+                          );
+                        },
+                        p: ({children}) => {
+                          // Check if children contains plain text that might have URLs
+                          const renderChildren = () => {
+                            if (!children) return null;
+                            
+                            return React.Children.map(children, (child) => {
+                              if (typeof child === 'string') {
+                                // Use LinkifiedText for plain text strings
+                                return <LinkifiedText text={child} />;
+                              }
+                              return child;
+                            });
+                          };
+                          
+                          return (
+                            <div className="mb-2 last:mb-0">
+                              {renderChildren()}
+                            </div>
+                          );
+                        }
                       }}
                     >
                       {formatUsageLimitText(String(message.content || ''))}
@@ -1103,7 +1153,7 @@ const MessageComponent = memo(({ message, index, prevMessage, createDiff, onFile
                   </div>
                 ) : (
                   <div className="whitespace-pre-wrap">
-                    {formatUsageLimitText(String(message.content || ''))}
+                    <LinkifiedText text={formatUsageLimitText(String(message.content || ''))} />
                   </div>
                 )}
               </div>
@@ -2671,9 +2721,22 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
     e.preventDefault();
     if (!input.trim() || isLoading || !selectedProject) return;
 
+    // Prevent multiple submissions while uploading
+    if (uploadingImages.size > 0) {
+      console.log('Image upload in progress, please wait...');
+      return;
+    }
+
     // Upload images first if any
     let uploadedImages = [];
     if (attachedImages.length > 0) {
+      // Mark all images as uploading
+      const uploadingMap = new Map();
+      attachedImages.forEach(file => {
+        uploadingMap.set(file.name, 0);
+      });
+      setUploadingImages(uploadingMap);
+      
       const formData = new FormData();
       attachedImages.forEach(file => {
         formData.append('images', file);
@@ -2698,8 +2761,13 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
         
         const result = await response.json();
         uploadedImages = result.images;
+        
+        // Clear uploading state on success
+        setUploadingImages(new Map());
       } catch (error) {
         console.error('Image upload failed:', error);
+        // Clear uploading state on error
+        setUploadingImages(new Map());
         setChatMessages(prev => [...prev, {
           type: 'error',
           content: `Failed to upload images: ${error.message}`,
@@ -3432,7 +3500,7 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
             {/* Send button */}
             <button
               type="submit"
-              disabled={!input.trim() || isLoading}
+              disabled={!input.trim() || isLoading || uploadingImages.size > 0}
               onMouseDown={(e) => {
                 e.preventDefault();
                 handleSubmit(e);
@@ -3443,19 +3511,23 @@ function ChatInterface({ selectedProject, selectedSession, ws, sendMessage, mess
               }}
               className="absolute right-2 top-1/2 transform -translate-y-1/2 w-12 h-12 sm:w-12 sm:h-12 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 disabled:cursor-not-allowed rounded-full flex items-center justify-center transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 dark:ring-offset-gray-800"
             >
-              <svg 
-                className="w-4 h-4 sm:w-5 sm:h-5 text-white transform rotate-90" 
-                fill="none" 
-                stroke="currentColor" 
-                viewBox="0 0 24 24"
-              >
-                <path 
-                  strokeLinecap="round" 
-                  strokeLinejoin="round" 
-                  strokeWidth={2} 
-                  d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" 
-                />
-              </svg>
+              {uploadingImages.size > 0 ? (
+                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+              ) : (
+                <svg 
+                  className="w-4 h-4 sm:w-5 sm:h-5 text-white transform rotate-90" 
+                  fill="none" 
+                  stroke="currentColor" 
+                  viewBox="0 0 24 24"
+                >
+                  <path 
+                    strokeLinecap="round" 
+                    strokeLinejoin="round" 
+                    strokeWidth={2} 
+                    d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" 
+                  />
+                </svg>
+              )}
             </button>
           </div>
           {/* Hint text */}

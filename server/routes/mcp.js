@@ -82,13 +82,14 @@ router.post('/cli/add', async (req, res) => {
         cliArgs.push('--header', `${key}: ${value}`);
       });
     } else {
-      // stdio (default): claude mcp add --scope user <name> <command> [args...]
+      // stdio (default): claude mcp add --scope user <name> -e ENV=value -- <command> [args...]
       cliArgs.push(name);
       // Add environment variables
       Object.entries(env).forEach(([key, value]) => {
         cliArgs.push('-e', `${key}=${value}`);
       });
-      cliArgs.push(command);
+      // Add the -- separator before the command
+      cliArgs.push('--', command);
       if (args && args.length > 0) {
         cliArgs.push(...args);
       }

@@ -37,6 +37,7 @@ import fetch from 'node-fetch';
 import mime from 'mime-types';
 
 import { getProjects, getSessions, getSessionMessages, renameProject, deleteSession, deleteProject, addProjectManually, extractProjectDirectory, clearProjectDirectoryCache } from './projects.js';
+import { handleTerminalWebSocket, cleanupTerminals } from './terminalHandler.js';
 import { spawnClaude, abortClaudeSession } from './claude-cli.js';
 import { spawnCursor, abortCursorSession } from './cursor-cli.js';
 import gitRoutes from './routes/git.js';
@@ -203,7 +204,9 @@ app.get('/api/config', authenticateToken, (req, res) => {
 
     res.json({
         serverPort: PORT,
-        wsUrl: `${protocol}://${host}`
+        wsUrl: `${protocol}://${host}`,
+        wsProtocol: protocol,
+        wsHost: host
     });
 });
 
@@ -468,6 +471,8 @@ wss.on('connection', (ws, request) => {
         handleShellConnection(ws);
     } else if (pathname === '/ws') {
         handleChatConnection(ws);
+    } else if (pathname === '/terminal') {
+        handleTerminalWebSocket(ws, request);
     } else {
         console.log('❌ Unknown WebSocket path:', pathname);
         ws.close();
@@ -992,6 +997,254 @@ app.post('/api/projects/:projectName/upload-images', authenticateToken, async (r
     }
 });
 
+// Folder upload endpoint
+app.post('/api/projects/:projectName/upload-folder', authenticateToken, async (req, res) => {
+    try {
+        const multer = (await import('multer')).default;
+        const path = (await import('path')).default;
+        const fs = (await import('fs')).promises;
+        const os = (await import('os')).default;
+        const { projectName } = req.params;
+
+        // Get the project path
+        const projectPath = await extractProjectDirectory(projectName);
+        if (!projectPath) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        // Configure multer for folder uploads
+        const storage = multer.diskStorage({
+            destination: async (req, file, cb) => {
+                const uploadDir = path.join(os.tmpdir(), 'claude-ui-folder-uploads', String(req.user.id));
+                await fs.mkdir(uploadDir, { recursive: true });
+                cb(null, uploadDir);
+            },
+            filename: (req, file, cb) => {
+                const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+                const sanitizedName = file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+                cb(null, uniqueSuffix + '-' + sanitizedName);
+            }
+        });
+
+        const upload = multer({
+            storage,
+            limits: {
+                fileSize: 50 * 1024 * 1024, // 50MB per file
+                files: 1000 // Max 1000 files
+            }
+        });
+
+        // Handle multipart form data
+        upload.array('files', 1000)(req, res, async (err) => {
+            if (err) {
+                return res.status(400).json({ error: err.message });
+            }
+
+            if (!req.files || req.files.length === 0) {
+                return res.status(400).json({ error: 'No files provided' });
+            }
+
+            try {
+                // Get the paths array from form data
+                const paths = req.body.paths;
+                const pathsArray = Array.isArray(paths) ? paths : [paths];
+
+                // Create folder structure and copy files
+                for (let i = 0; i < req.files.length; i++) {
+                    const file = req.files[i];
+                    const relativePath = pathsArray[i] || file.originalname;
+                    
+                    // Construct destination path
+                    const destPath = path.join(projectPath, relativePath);
+                    const destDir = path.dirname(destPath);
+
+                    // Create directory structure
+                    await fs.mkdir(destDir, { recursive: true });
+
+                    // Move file from temp to destination
+                    await fs.copyFile(file.path, destPath);
+                    
+                    // Clean up temp file
+                    await fs.unlink(file.path);
+                }
+
+                res.json({ 
+                    message: 'Folder uploaded successfully',
+                    filesCount: req.files.length
+                });
+            } catch (error) {
+                console.error('Error processing folder upload:', error);
+                // Clean up any remaining temp files
+                await Promise.all(req.files.map(f => fs.unlink(f.path).catch(() => { })));
+                res.status(500).json({ error: 'Failed to process folder upload: ' + error.message });
+            }
+        });
+    } catch (error) {
+        console.error('Error in folder upload endpoint:', error);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Delete file or directory endpoint
+app.post('/api/projects/:projectName/delete', authenticateToken, async (req, res) => {
+    try {
+        const fs = (await import('fs')).promises;
+        const path = (await import('path')).default;
+        const { projectName } = req.params;
+        const { path: filePath } = req.body;
+
+        if (!filePath) {
+            return res.status(400).json({ error: 'Path is required' });
+        }
+
+        // Get the project path
+        const projectPath = await extractProjectDirectory(projectName);
+        if (!projectPath) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        // Since getFileTree returns absolute paths, we should use the filePath directly
+        // but still verify it's within the project directory
+        const resolvedPath = path.resolve(filePath);
+        const resolvedProjectPath = path.resolve(projectPath);
+        
+        // Security check - ensure the path is within the project directory
+        if (!resolvedPath.startsWith(resolvedProjectPath)) {
+            return res.status(403).json({ error: 'Access denied: Path is outside project directory' });
+        }
+
+        // Check if file/directory exists
+        try {
+            const stats = await fs.stat(resolvedPath);
+            
+            // Delete file or directory
+            if (stats.isDirectory()) {
+                await fs.rm(resolvedPath, { recursive: true, force: true });
+            } else {
+                await fs.unlink(resolvedPath);
+            }
+
+            res.json({ message: 'Deleted successfully' });
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                return res.status(404).json({ error: 'File or directory not found' });
+            }
+            throw error;
+        }
+    } catch (error) {
+        console.error('Error in delete endpoint:', error);
+        res.status(500).json({ error: 'Failed to delete: ' + error.message });
+    }
+});
+
+// Rename file or directory endpoint
+app.post('/api/projects/:projectName/rename', authenticateToken, async (req, res) => {
+    try {
+        const fs = (await import('fs')).promises;
+        const path = (await import('path')).default;
+        const { projectName } = req.params;
+        const { oldPath, newPath } = req.body;
+
+        if (!oldPath || !newPath) {
+            return res.status(400).json({ error: 'Both oldPath and newPath are required' });
+        }
+
+        // Get the project path
+        const projectPath = await extractProjectDirectory(projectName);
+        if (!projectPath) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        // Since getFileTree returns absolute paths, handle both absolute and relative paths
+        const resolvedOldPath = path.resolve(oldPath);
+        const resolvedNewPath = path.resolve(newPath);
+        const resolvedProjectPath = path.resolve(projectPath);
+        
+        // Security check - ensure both paths are within the project directory
+        if (!resolvedOldPath.startsWith(resolvedProjectPath) || !resolvedNewPath.startsWith(resolvedProjectPath)) {
+            return res.status(403).json({ error: 'Access denied: Path is outside project directory' });
+        }
+
+        // Check if source exists
+        try {
+            await fs.stat(resolvedOldPath);
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                return res.status(404).json({ error: 'Source file or directory not found' });
+            }
+            throw error;
+        }
+
+        // Check if target already exists
+        try {
+            await fs.stat(resolvedNewPath);
+            return res.status(400).json({ error: 'Target already exists' });
+        } catch (error) {
+            if (error.code !== 'ENOENT') {
+                throw error;
+            }
+        }
+
+        // Ensure target directory exists
+        const targetDir = path.dirname(resolvedNewPath);
+        await fs.mkdir(targetDir, { recursive: true });
+
+        // Rename/move the file or directory
+        await fs.rename(resolvedOldPath, resolvedNewPath);
+
+        res.json({ message: 'Renamed successfully' });
+    } catch (error) {
+        console.error('Error in rename endpoint:', error);
+        res.status(500).json({ error: 'Failed to rename: ' + error.message });
+    }
+});
+
+// Save file endpoint
+app.put('/api/projects/:projectName/file', authenticateToken, async (req, res) => {
+    try {
+        const fs = (await import('fs')).promises;
+        const path = (await import('path')).default;
+        const { projectName } = req.params;
+        const { filePath, content } = req.body;
+
+        if (!filePath) {
+            return res.status(400).json({ error: 'File path is required' });
+        }
+
+        if (content === undefined) {
+            return res.status(400).json({ error: 'Content is required' });
+        }
+
+        // Get the project path
+        const projectPath = await extractProjectDirectory(projectName);
+        if (!projectPath) {
+            return res.status(404).json({ error: 'Project not found' });
+        }
+
+        // Construct full path
+        const fullPath = path.join(projectPath, filePath);
+
+        // Security check - ensure the path is within the project directory
+        const resolvedPath = path.resolve(fullPath);
+        const resolvedProjectPath = path.resolve(projectPath);
+        if (!resolvedPath.startsWith(resolvedProjectPath)) {
+            return res.status(403).json({ error: 'Access denied: Path is outside project directory' });
+        }
+
+        // Ensure directory exists
+        const dir = path.dirname(resolvedPath);
+        await fs.mkdir(dir, { recursive: true });
+
+        // Write file
+        await fs.writeFile(resolvedPath, content, 'utf8');
+
+        res.json({ message: 'File saved successfully' });
+    } catch (error) {
+        console.error('Error saving file:', error);
+        res.status(500).json({ error: 'Failed to save file: ' + error.message });
+    }
+});
+
 // Serve React app for all other routes
 app.get('*', (req, res) => {
   if (process.env.NODE_ENV === 'production') {
@@ -1105,3 +1358,16 @@ async function startServer() {
 }
 
 startServer();
+
+// Cleanup on exit
+process.on('SIGINT', () => {
+    console.log('\n🛑 Shutting down...');
+    cleanupTerminals();
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    console.log('\n🛑 Shutting down...');
+    cleanupTerminals();
+    process.exit(0);
+});

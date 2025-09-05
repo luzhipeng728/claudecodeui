@@ -838,13 +838,41 @@ async function deleteProject(projectName) {
 
 // Add a project manually to the config (without creating folders)
 async function addProjectManually(projectPath, displayName = null) {
-  const absolutePath = path.resolve(projectPath);
+  // Handle non-absolute paths by creating them in /tmp
+  let absolutePath;
+  if (path.isAbsolute(projectPath)) {
+    absolutePath = path.resolve(projectPath);
+  } else {
+    absolutePath = path.join('/tmp', projectPath);
+  }
   
   try {
     // Check if the path exists
     await fs.access(absolutePath);
   } catch (error) {
-    throw new Error(`Path does not exist: ${absolutePath}`);
+    // Create the directory if it doesn't exist
+    try {
+      await fs.mkdir(absolutePath, { recursive: true });
+      console.log(`Created directory: ${absolutePath}`);
+      
+      // Initialize git repository if it doesn't exist
+      try {
+        const gitPath = path.join(absolutePath, '.git');
+        await fs.access(gitPath);
+        console.log(`Git repository already exists in: ${absolutePath}`);
+      } catch {
+        // Git repo doesn't exist, initialize it
+        const { execSync } = await import('child_process');
+        try {
+          execSync('git init', { cwd: absolutePath, stdio: 'pipe' });
+          console.log(`Initialized git repository in: ${absolutePath}`);
+        } catch (gitError) {
+          console.log(`Warning: Could not initialize git repository: ${gitError.message}`);
+        }
+      }
+    } catch (mkdirError) {
+      throw new Error(`Failed to create directory: ${absolutePath}, Error: ${mkdirError.message}`);
+    }
   }
   
   // Generate project name (encode path for use as directory name)
